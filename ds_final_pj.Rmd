@@ -1,0 +1,677 @@
+---
+title: "DS_project"
+author: "Zicheng Yan"
+date: "2024-05-07"
+output: html_document
+---
+load packages
+```{r warning=FALSE}
+library(dplyr)
+library(TTR)
+library(randomForest)
+library(lubridate)
+library(tree)
+library(ggplot2)
+library(keras)
+library(skimr)
+library(GGally)
+library(corrplot)
+library(tidyverse)
+library(ROSE)
+library(caret)
+library(synthpop)
+library(pROC)
+library(e1071)
+library(rpart)
+library(rpart.plot)
+library(xgboost)
+```
+```{r}
+#install.packages("doParallel")
+library(doParallel)
+numCores <- detectCores()
+cl <- makeCluster(numCores - 1) # Leave one core free
+registerDoParallel(cl)
+
+```
+
+
+
+
+read the dataset
+
+```{r}
+data.bank = read.csv("~/jhu/DS project/bank-additional-full.csv", sep=";")
+```
+
+Overview of the data
+
+```{r}
+summary(data.bank)
+```
+Skim for a detailed summary
+
+```{r}
+skim(data.bank)
+```
+
+Check for missing values
+
+```{r}
+sum(is.na(data.bank))
+```
+Visualize correlations between numerical features
+
+```{r}
+numeric_data = data.bank %>% select_if(is.numeric)
+cor_matrix = cor(numeric_data, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper", order = "hclust", 
+         addCoef.col = "black",  # Add correlation coefficients to the plot
+         diag = FALSE)  # Do not show diagonal
+```
+Strong correlation detected between nr.employed, euribor3m, and emp.var.rate. 
+This issue will be handled later with PCA.
+
+
+The categorical variables are in type 'chr' instead of 'factor', which needs to be corrected
+
+```{r}
+categorical_data <- data.bank %>% 
+  select_if(~is.character(.)) %>%  
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+categorical_columns <- c("job", 
+"marital",
+"education",
+"default",
+"housing",
+"loan",
+"contact",
+"month",
+"day_of_week",
+"poutcome",
+"y")
+data.bank[categorical_columns] <- lapply(data.bank[categorical_columns], factor)
+```
+
+We will dummy code categorical variables with 3 or less categories and encode the rest.
+Although for tree based model this isn't necessary, we plan to apply other models
+like RNN and logistic regression.
+
+```{r}
+data <- data.bank
+
+# Separate variables based on the number of categories
+variables_to_dummy <- names(which(sapply(data, function(x) is.factor(x) && length(levels(x)) <= 3)))
+variables_to_encode <- names(which(sapply(data, function(x) is.factor(x) && length(levels(x)) > 3)))
+
+# Apply dummy coding to variables with 3 or fewer categories using dummyVars
+dummy_vars <- dummyVars(~ ., data = data[, variables_to_dummy], fullRank = FALSE)
+data_dummies <- predict(dummy_vars, newdata = data)
+
+# Integrate dummies back into the main dataset
+data <- cbind(data[, !(names(data) %in% variables_to_dummy)], data_dummies)
+
+# For variables with more than 3 categories, apply integer encoding
+data[, variables_to_encode] <- lapply(data[, variables_to_encode], function(x) as.integer(as.factor(x)))
+
+
+# Check the transformed data structure
+str(data)
+```
+```{r}
+data = data%>% select(-y.no)
+data = data%>% rename(y = y.yes)
+str(data)
+```
+
+
+
+
+
+Plotting the distribution of cat vars
+
+```{r}
+ggplot(categorical_data, aes(x = value)) +
+  geom_bar() +
+  facet_wrap(~ variable, scales = "free_x", nrow = 2) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0, size = 8)) +
+  labs(title = "Distribution of Categorical Variables")
+```
+We can easily notice that this dataset is not very balanced on target variable y.
+Since we don't want to lose too much data, we decided to use a combination of over and under sampling.
+
+We also considered data implementation technique like SMOTE, but given that we have a large portion of categorical variables, it probably won't work well. 
+
+
+Taking a look into the features
+
+Start with a quick rf model to tell feature importance and serve as benchmark model
+
+```{r}
+rf_model <- randomForest(y ~ ., data = data.bank, ntree = 500, importance = TRUE)
+print(rf_model)
+
+importance_scores <- importance(rf_model, type = 1)
+print(importance_scores)
+importance_df <- data.frame(Feature = rownames(importance_scores), Importance = importance_scores[, "MeanDecreaseAccuracy"])
+
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip() +  # Flips the axes to make it easier to read
+  labs(title = "Feature Importance (Random Forest)", x = "Features", y = "Importance") +
+  theme_minimal()
+```
+A feature with negative importance! This is rare. We should carefully consider whether to drop it
+
+The variable "duration" has shown the greatest importance, however, it stands for last contact duration (how many days since last call). Therefore, it is  not known before a call is performed. Also, after the end of the call y is obviously known. Thus, it will be included only for this benchmark model since we want to have a realistic predictive model.
+
+
+To conduct some real training, we need to perform train-test split before balancing to prevent any possible feature leakage.Feature engineering like PCA should also be done before the split.
+
+```{r}
+set.seed(42) # The Ultimate Answer to the Universe
+data = data %>% select(-duration) # Dropping duration
+
+# perform pca on these 3 features with strong correlation
+pca_data <- data[, c("nr.employed", "euribor3m", "emp.var.rate")] 
+pca_result <- prcomp(pca_data, scale. = TRUE)
+summary(pca_result)
+
+```
+Based on the variance each component contains, we only need to keep PC1 and 2
+
+```{r}
+# Replace the 3 variables with PC1 and PC2
+pc_scores <- pca_result$x
+pc_scores <- pc_scores[, 1:2]
+colnames(pc_scores) <- paste("PC", 1:2, sep="")
+data <- data[, !names(data) %in% c("nr.employed", "euribor3m", "emp.var.rate")]
+data <- cbind(data, pc_scores)
+
+```
+
+Standardization: since we plan to use models like SVM and RNN that are sensitive to the scale of data,
+we need to create a separated pipeline here for standardization.
+
+```{r}
+data_scaled <- as.data.frame(lapply(data[, -which(names(data) == "y")], scale))
+data_scaled$target <- data$target
+```
+
+
+Next we perform train test split
+
+```{r}
+split <- createDataPartition(data$y, p = 0.75, list = FALSE)
+train_set <- data[split, ]
+test_set <- data[-split, ]
+```
+
+Print out the distribution of target class
+```{r}
+table(train_set$y)
+```
+Clearly the data set is imbalanced, so we will balance it with a combination of oversampling minority class and under sampling majority class, eventually reach a level that
+
+ majority : minority about 2 : 1
+
+```{r}
+train_balanced = ovun.sample(y ~ ., data = train_set, method = "both", N = 20000, p = 0.3)$data
+table(train_balanced$y)
+```
+We decided to also try synthpop, a  tool that can generate synthetic data for both numeric and categorical data types.It uses statistical modeling to predict each variable based on the others.
+
+```{r}
+
+synthetic_data = syn(train_set, seed = 42) # The ultimate answer of the universe
+synthetic_minority_only = synthetic_data$syn[synthetic_data$syn$y == "1", ]
+
+```
+Remove some "no" observations so the resulting set has similar distribution
+
+```{r}
+indices_of_no <- which(train_set$y == "0")
+indices_to_remove <- sample(indices_of_no, length(indices_of_no) / 2)
+reduced_train_set <- train_set[-indices_to_remove, ]
+
+train_syn <- rbind(reduced_train_set, synthetic_minority_only)
+table(train_syn$y)
+```
+
+--- End of Preprocessing (hopefully) ---
+
+
+--- Modeling Starts Here ---
+
+
+
+
+
+--- Logistic Model ---
+
+Let's start with fitting a loigstic model on plain training set with no data balancing 
+
+```{r}
+logit_model <- glm(y ~ ., data = train_set, family = binomial())
+summary(logit_model)
+```
+
+But before evaluation let's create a function for computing these metrics cause we are going to do this many times
+```{r}
+calculate_metrics <- function(confusionMatrix) {
+  # Extract counts from the confusion matrix
+  TP <- confusionMatrix[2, 2]
+  TN <- confusionMatrix[1, 1]
+  FP <- confusionMatrix[1, 2]
+  FN <- confusionMatrix[2, 1]
+  
+  # Calculate accuracy
+  accuracy <- (TP + TN) / sum(confusionMatrix)
+  
+  # Calculate False Positive Rate (FPR) and False Negative Rate (FNR)
+  FPR <- FP / (FP + TN)
+  FNR <- FN / (FN + TP)
+  
+  # Calculate precision and recall
+  precision <- TP / (TP + FP)
+  recall <- TP / (TP + FN)
+  
+  # Calculate F1 score
+  F1 <- 2 * (precision * recall) / (precision + recall)
+  
+  # Create a data frame to neatly display the metrics
+  metrics_df = data.frame(
+    Metric = c("Accuracy", "False Positive Rate", "False Negative Rate", "Precision", "Recall", "F1 Score"),
+    Value = c(accuracy, FPR, FNR, precision, recall, F1)
+  )
+  
+  # Print the data frame as a table
+  print(metrics_df, row.names = FALSE)
+}
+```
+
+
+Make prediction with 0.5 cutoff to calculate accuracy and show confusion matrix
+```{r}
+test_set$predicted_prob <- predict(logit_model, newdata = test_set, type = "response")
+test_set$predicted_class <- ifelse(test_set$predicted_prob > 0.5, 1, 0)
+confusionMatrix <- table(test_set$y, test_set$predicted_class)
+
+print(confusionMatrix)
+
+# Call the function we just created
+calculate_metrics(confusionMatrix)
+
+
+
+```
+Though the accuracy is not bad, the F1 score is poor and the False Negative Rate is extremely high.
+Let's see if this could be solved with more balanced data.
+
+```{r}
+logit_model_balanced <- glm(y ~ ., data = train_balanced, family = binomial())
+#summary(logit_model_balanced)
+logit_model_syn <- glm(y ~ ., data = train_syn, family = binomial())
+#summary(logit_model_syn)
+
+```
+
+```{r}
+test_set$predicted_prob <- predict(logit_model_balanced, newdata = test_set, type = "response")
+# Yeah I know I should probably set up a new pointer for new predictions, but there are so many models
+# and I really want to save some memory
+test_set$predicted_class <- ifelse(test_set$predicted_prob > 0.5, 1, 0)
+print("Result of using oversampled data")
+confusionMatrix <- table(test_set$y, test_set$predicted_class)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+
+
+test_set$predicted_prob <- predict(logit_model_syn, newdata = test_set, type = "response")
+test_set$predicted_class <- ifelse(test_set$predicted_prob > 0.5, 1, 0)
+print("Result of using generated data")
+confusionMatrix <- table(test_set$y, test_set$predicted_class)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+
+```
+By using the balanced dataset, the false negative rate has been lowered to less than 0.5, proving that
+our preprocessing is effective. Also, the model built with oversampled data has outperformed the other one 
+in all measures. And given that generating data, especially this much of data (2 times more minority class!),
+is inherently more risky than using oversampling to balance data, we will focus more on train_balanced set. 
+
+```{r}
+test_set$predicted_prob <- predict(logit_model_balanced, newdata = test_set, type = "response")
+
+ggplot(test_set, aes(x = as.factor(y), y = predicted_prob, colour = as.factor(y))) +
+  geom_boxplot() +
+  labs(title = "Distribution of Predicted Probabilities by Actual Class",
+       x = "Actual Class",
+       y = "Predicted Probability",
+       colour = "Actual Class") +
+  theme_minimal()
+```
+Looking at the predicted prob distribution, we realize that we might be able to "improve" the model
+performance by simply using a lower cutoff.
+
+```{r}
+test_set$predicted_prob <- predict(logit_model_balanced, newdata = test_set, type = "response")
+test_set$predicted_class <- ifelse(test_set$predicted_prob > 0.48, 1, 0)
+print("Result of using oversampled data")
+confusionMatrix <- table(test_set$y, test_set$predicted_class)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+
+
+test_set$predicted_prob <- predict(logit_model_syn, newdata = test_set, type = "response")
+test_set$predicted_class <- ifelse(test_set$predicted_prob > 0.48, 1, 0)
+print("Result of using generated data")
+confusionMatrix <- table(test_set$y, test_set$predicted_class)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+```
+We've tried 5 different cutoffs ranging from 0.48 to 0.32, none of them is able to improve the performance in terms of F1 score and accuracy. However, given the nature of the task: identifying user for marketing campaign, this  decision threshold might be useful. It represents a trade-off between more cost (higher False Positive Rate) and more new subscription (False Negative Rate).
+
+```{r}
+
+log_roc_result <- roc(test_set$y, test_set$predicted_prob)
+log_auc_value <- auc(log_roc_result)
+plot(log_roc_result, main = "ROC Curve for Logistic")
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(log_auc_value, 3)), cex = 1.2, col = "blue")
+```
+
+
+
+--- SVM Model ---
+
+For SVM we need standardization, so we need to continue work on data_scaled
+
+
+
+```{r}
+data_scaled$y = data$y
+split <- createDataPartition(data_scaled$y, p = 0.75, list = FALSE)
+train_set_scaled <- data_scaled[split, ]
+test_set_scaled <- data_scaled[-split, ]
+
+train_balanced_scaled = ovun.sample(y ~ ., data = train_set_scaled, method = "both", N = 20000, p = 0.3)$data
+table(train_balanced_scaled$y)
+
+```
+
+
+Converting the type of y to factor, train on a SVM classifier
+
+
+
+```{r}
+
+train_balanced_scaled$y <- as.factor(train_balanced_scaled$y)
+test_set_scaled$y <- as.factor(test_set_scaled$y)
+
+svm_model <- svm(y ~ ., data = train_balanced_scaled, kernel = "radial", cost = 1, scale = FALSE)
+print(svm_model)
+```
+
+```{r}
+test_set_scaled$predicted <- predict(svm_model, test_set_scaled, type = "response")
+confusionMatrix <- table(Predicted = test_set_scaled$predicted, Actual = test_set_scaled$y)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+```
+The performance is basically the same as logistic model, let's see if we can make it better with fine-tuning
+It's taking incredibly long so we commented this part.
+
+```{r}
+# Set up the parameter grid
+# tune_result <- tune(svm, train.x = y ~ ., data = train_balanced_scaled, 
+#                     kernel = "radial", scale = FALSE, cross = 2,
+#                     ranges = list(cost = 10^(-1:1), gamma = 10^(-2:0)))
+# 
+# # Print the best model found
+# print(tune_result$best.model)
+```
+
+
+--- Decision Tree ---
+
+Build a decision tree model for interpretability
+
+Since tree-based models are not sensitive to scale and accept factor type features, 
+we only need to address the extreme data imbalance.
+
+
+```{r}
+data_tree = data.bank %>% select(-duration)
+split <- createDataPartition(data_tree$y, p = 0.75, list = FALSE)
+train_tree <- data_tree[split, ]
+test_tree <- data_tree[-split, ]
+
+train_tree = ovun.sample(y ~ ., data = train_tree, method = "both", N = 20000, p = 0.3)$data
+table(train_tree$y)
+
+```
+```{r}
+decision_tree_model <- rpart(y ~ ., data = train_tree, method = "class")
+rpart.plot(decision_tree_model, main="Decision Tree", extra=102, under=TRUE, faclen=0)
+```
+This is interesting... The decision tree graph shows the single most important factor is nr.employed, which
+is a economic context indicator, the number of employees. So probably the bank should consider only conduct 
+direct marketing campaigns when the economy is cooling, specifically, when the quarterly newly employed number
+is less than 5088. 
+
+```{r}
+importance <- as.data.frame(varImp(decision_tree_model, scale=FALSE))
+print(importance)
+```
+Further analysis in feature importance reveals that the most important features are emp.var.rate, euribor3m, and nr.employed. These
+three features are highly correlated and all represents the economic context, employment and job market. And the personal information 
+of clients almost has no impact.
+Thus, we suggest the bank to look close into quarterly and monthly employment and macro economics reports to determine the best time
+for marketing campaign.
+
+
+```{r}
+test_tree$predictions <- predict(decision_tree_model, newdata = test_tree, type = "class")
+conf_matrix <- confusionMatrix(test_tree$predictions, test_tree$y)
+print(conf_matrix)
+```
+No great improvement from previous models, the problem of imbalanced data and high FNR still exist.
+
+```{r}
+test_tree$tree_prob_predictions <- predict(decision_tree_model, newdata = test_tree, type = "prob")
+test_tree$tree_positive_probs <- test_tree$tree_prob_predictions[, "yes"]
+tree_roc_result <- roc(test_tree$y, test_tree$tree_positive_probs)
+tree_auc_value <- auc(tree_roc_result)
+plot(tree_roc_result, main = "ROC Curve for Decision Tree")
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(tree_auc_value, 3)), cex = 1.2, col = "blue")
+```
+
+
+--- Random Forest ---
+
+
+```{r}
+rf_model <- randomForest(y ~ ., data = train_tree, ntree=500, mtry=3, importance=TRUE)
+test_tree$predictions <- predict(rf_model, newdata = test_tree)
+
+confusionMatrix <- table(Predicted = test_tree$predictions, Actual = test_tree$y)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+```
+Similar result
+
+```{r}
+importance <- importance(rf_model)
+print(importance)
+
+# Plot variable importance
+varImpPlot(rf_model)
+```
+It seems variables like job, day_of_week, and age show higher importance based on Mean Decrease Accuracy, suggesting these features significantly impact the model's predictive accuracy.
+On the other hand, euribor3m, nr.employed, and age are leading in terms of Gini importance, indicating that they are frequently used in making splits that help to purify the nodes, thus they are critical in defining the structure of the forest.
+
+Let's see if fine-tuning can make this better
+
+```{r}
+help(train)
+train_control <- trainControl(method="cv", number=5)
+
+# Train the model with tuning grid
+tuned_model <- train(y ~ ., data=train_tree, method="rf", trControl=train_control,
+                     tuneGrid=data.frame(mtry=c(2, 3, 4)),
+                     ntree=300)
+
+
+```
+
+```{r}
+test_tree$predictions <- predict(tuned_model, newdata = test_tree)
+confusionMatrix <- table(Predicted = test_tree$predictions, Actual = test_tree$y)
+print(confusionMatrix)
+calculate_metrics(confusionMatrix)
+```
+Okay... No significant difference.
+
+```{r}
+test_tree$rf_prob_predictions <- predict(rf_model, newdata = test_tree, type = "prob")
+test_tree$rf_positive_probs <- test_tree$rf_prob_predictions[, "yes"]
+rf_roc_result <- roc(test_tree$y, test_tree$rf_positive_probs)
+rf_auc_value <- auc(rf_roc_result)
+plot(rf_roc_result, main = "ROC Curve for Random Forest")
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(rf_auc_value, 3)), cex = 1.2, col = "red")
+```
+
+
+--- RNN ---
+
+Since RNN is sensitive to scale, we will be using the training_balanced_scaled
+
+First covert y to categorical
+
+Also please note this requires a python environment with keras
+
+```{r}
+library(reticulate)
+use_python("C:\\Users\\16784\\AppData\\Local\\Programs\\Python\\Python311", required = TRUE) # set path to your python dir with keras
+# or use keras::install_keras(tensorflow = "default") to install keras in the virtual environment
+train_labels <- to_categorical(train_balanced_scaled$y)
+test_labels <- to_categorical(test_set_scaled$y)
+```
+Convert to matrix for training
+```{r}
+train_data <- as.matrix(train_balanced_scaled[, -which(names(train_balanced_scaled) == "y")])
+test_data <- as.matrix(test_set_scaled[, -which(names(test_set_scaled) == "y")])
+```
+
+```{r}
+# Define F1 Score as a custom metric
+f1_score <- function(y_true, y_pred) {
+  y_pred <- k_cast(k_greater(y_pred, 0.5), 'float32')
+  tp <- k_sum(y_true * y_pred)
+  precision <- tp / (k_sum(y_pred) + k_epsilon())
+  recall <- tp / (k_sum(y_true) + k_epsilon())
+  f1_val <- 2 * (precision * recall) / (precision + recall + k_epsilon())
+  return(f1_val)
+}
+
+# Add custom F1 Score metric to the model
+metric_f1_score <- custom_metric("f1_score", f1_score)
+```
+
+
+```{r warning=FALSE}
+# Design the model
+# Only 2 computing layers due to overfitting, it turns out we don't really need much complexity
+model <- keras_model_sequential() %>%
+  layer_dense(units = 8, activation = 'relu', input_shape = c(27), kernel_regularizer = regularizer_l2(0.01)) %>%
+  layer_dropout(rate = 0.3) %>% # Adding dropout layer since we observed overfitting in a few epochs
+  layer_dense(units = 2, activation = 'softmax') # 2 neurons output layer since we have 2 classes
+
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_rmsprop(learning_rate = 0.00001),
+  metrics = list(metric_auc(curve = "ROC"), metric_f1_score)
+)
+
+```
+
+```{r warning=FALSE}
+# Fit the model
+history <- model %>% fit(
+  train_data,
+  train_labels,
+  epochs = 10,
+  batch_size = 128,
+  validation_split = 0.2
+)
+```
+No matter how we perform hyperparameter tuning, the validation loss and val F1 score just won't improve weith more training. Although the
+model is a failure, it has some important implications: there is basically no more "hidden" information remain uncaptured by our simpler models. Increasing the complexity would only make things worse. The imbalanced initial dataset is the real bottleneck of the prediction model.
+
+
+--- XGboost ---
+
+An ensembled model for structured dataset
+Given its nature, we will be using the same dataset as we did in logistic regression
+
+```{r include=FALSE}
+split <- createDataPartition(data$y, p = 0.75, list = FALSE)
+train_set <- data[split, ]
+test_set <- data[-split, ]
+train_balanced = ovun.sample(y ~ ., data = train_set, method = "both", N = 20000, p = 0.3)$data
+
+# XGBoost uses a specialized data structure called DMatrix that is optimized for both memory efficiency and training speed.
+train_labels_integer <- apply(train_labels, 1, function(row) which(row == 1) - 1)
+test_labels_integer <- apply(test_labels, 1, function(row) which(row == 1) - 1)
+train_balanced %>% select(-y)
+test_set %>% select(-y)
+dtrain <- xgb.DMatrix(data = as.matrix(train_balanced), label = train_labels_integer)
+dtest <- xgb.DMatrix(data = as.matrix(test_set), label = test_labels_integer)
+
+```
+
+Define params
+
+```{r}
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.5,
+  colsample_bytree = 0.5
+)
+```
+
+Train the model
+
+```{r}
+xgb_model <- xgb.train(params = params, data = dtrain, nrounds = 100, watchlist = list(eval = dtest), early_stopping_rounds = 10)
+```
+Using a 0.5 cutoff
+```{r}
+pred <- predict(xgb_model, dtest)
+binary_preds <- ifelse(pred > 0.5, 1, 0)
+actual_labels <- getinfo(dtest, "label")  # Get the actual labels from the DMatrix
+conf_matrix <- confusionMatrix(factor(binary_preds, levels = c(0, 1)), factor(actual_labels, levels = c(0, 1)))
+print(conf_matrix)
+
+```
+```{r}
+xgb_roc_curve <- roc(response = actual_labels, predictor = pred)
+xgb_auc_value <- auc(xgb_roc_curve)
+plot(xgb_roc_curve, main = "XGBoost ROC Curve")
+text(x = 0.6, y = 0.2, labels = paste("AUC =", round(xgb_auc_value, 3)), cex = 1.2, col = "red")
+```
+
+Finally, a plot aggregate the ROC curves of my models
+
+```{r}
+plot(xgb_roc_curve, main = "Compairson of ROC Curves", col = "red", lwd = 2)
+lines(rf_roc_result, col = "blue", lwd = 2)
+lines(log_roc_result, col = "green", lwd = 2)
+legend("bottomright", legend = c("XGBoost", "Random Forest", "Logistic"), col = c("red", "blue", "green"), lwd = 2)
+```
+
